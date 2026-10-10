@@ -14,7 +14,38 @@ use winit::window::Window;
 
 use crate::geom::{self, Vertex};
 use crate::mark::Shape;
-use crate::scene::{Frame, HERE_RING_HEIGHT, HERE_RING_SCALE, HERE_RING_Y};
+use crate::scene::{Frame, TileView, HERE_RING_HEIGHT, HERE_RING_SCALE, HERE_RING_Y};
+
+/// Which pattern is drawn on the plaza floor. `grid` is the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Floor {
+    Grid,
+    Hex,
+    Checker,
+}
+
+impl Floor {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "grid" => Some(Self::Grid),
+            "hex" => Some(Self::Hex),
+            "checker" => Some(Self::Checker),
+            _ => None,
+        }
+    }
+
+    pub fn names() -> &'static str {
+        "grid, hex, checker"
+    }
+
+    fn code(self) -> f32 {
+        match self {
+            Self::Grid => 0.0,
+            Self::Hex => 1.0,
+            Self::Checker => 2.0,
+        }
+    }
+}
 
 const SHADER: &str = r#"
 struct Uniforms {
@@ -52,11 +83,23 @@ struct VsOut {
 fn vs_mesh(in: VsIn) -> VsOut {
     let model = mat4x4<f32>(in.m0, in.m1, in.m2, in.m3);
     let nmat = mat4x4<f32>(in.n0, in.n1, in.n2, in.n3);
-    let world = model * vec4<f32>(in.position, 1.0);
+    // A command segment is built as 1 radian of arc. params.y is its center
+    // angle and params.z is the sweep, so one mesh fits every count.
+    var pos = in.position;
+    var nrm = in.normal;
+    if (in.params.w > 1.5) {
+        let rest = atan2(pos.z, pos.x);
+        let delta = in.params.y + rest * (in.params.z - 1.0);
+        let c = cos(delta);
+        let s = sin(delta);
+        pos = vec3<f32>(pos.x * c - pos.z * s, pos.y, pos.x * s + pos.z * c);
+        nrm = vec3<f32>(nrm.x * c - nrm.z * s, nrm.y, nrm.x * s + nrm.z * c);
+    }
+    let world = model * vec4<f32>(pos, 1.0);
     var out: VsOut;
     out.clip = u.view_proj * world;
     out.world = world.xyz;
-    out.normal = normalize((nmat * vec4<f32>(in.normal, 0.0)).xyz);
+    out.normal = normalize((nmat * vec4<f32>(nrm, 0.0)).xyz);
     out.color = in.color;
     out.params = in.params;
     return out;
@@ -96,19 +139,72 @@ fn fs_blend(in: VsOut) -> @location(0) vec4<f32> {
     let dist = length(in.world.xz);
     let radius = max(in.params.x, 1.0);
     let fade = 1.0 - smoothstep(radius * 0.35, radius, dist);
-    let fine = grid_line(in.world.xz, 1.25);
-    let coarse = grid_line(in.world.xz, 6.25);
-    let line = max(fine * 0.55, coarse);
-    let alpha = line * 0.45 * fade;
+    // params.y picks the floor: 0 grid, 1 hex, 2 checker.
+    if (in.params.y > 1.5) {
+        let tone = checker(in.world.xz, 1.7);
+        let rgb = mix(vec3<f32>(0.30, 0.42, 0.46), vec3<f32>(0.36, 0.50, 0.54), tone);
+        let alpha = mix(0.12, 0.18, tone) * fade;
+        if (alpha < 0.015) {
+            discard;
+        }
+        return vec4<f32>(rgb, alpha);
+    }
+    var line: f32;
+    if (in.params.y > 0.5) {
+        line = hex_line(in.world.xz, 0.95);
+    } else {
+        let fine = grid_line(in.world.xz, 0.85, 0.006);
+        let coarse = grid_line(in.world.xz, 4.25, 0.012);
+        line = max(fine * 0.65, coarse);
+    }
+    let alpha = line * 0.7 * fade;
     if (alpha < 0.02) {
         discard;
     }
     return vec4<f32>(in.color.rgb, alpha);
 }
 
-fn grid_line(xz: vec2<f32>, cell: f32) -> f32 {
-    let g = abs(fract(xz / cell) - 0.5);
-    return 1.0 - smoothstep(0.012, 0.045, min(g.x, g.y));
+// Distance to the nearest grid line, in world units. `width` is the solid core.
+fn grid_line(xz: vec2<f32>, cell: f32, width: f32) -> f32 {
+    let scaled = xz / cell;
+    let along = abs(fract(scaled - 0.5) - 0.5) * cell;
+    let fw = max(fwidth(xz), vec2<f32>(0.0005));
+    let ax = 1.0 - smoothstep(width, width + fw.x * 1.25, along.x);
+    let ay = 1.0 - smoothstep(width, width + fw.y * 1.25, along.y);
+    return max(ax, ay);
+}
+
+// Fine honeycomb. `size` is the center-to-corner distance of one hex.
+fn hex_line(xz: vec2<f32>, size: f32) -> f32 {
+    let p = xz / size;
+    // Flat-top, so a side faces the camera and the cells still read as hexes.
+    let q = (2.0 / 3.0) * p.x;
+    let r = (-1.0 / 3.0) * p.x + (1.7320508 / 3.0) * p.y;
+    let s = -q - r;
+    var rq = round(q);
+    var rr = round(r);
+    let rs = round(s);
+    let dq = abs(rq - q);
+    let dr = abs(rr - r);
+    let ds = abs(rs - s);
+    if (dq > dr && dq > ds) {
+        rq = -rr - rs;
+    } else if (dr > ds) {
+        rr = -rq - rs;
+    }
+    let lq = q - rq;
+    let lr = r - rr;
+    let edge = max(max(abs(lq), abs(lr)), abs(-lq - lr));
+    let dist = (0.5 - edge) * size * 1.7320508;
+    // Use the ground's own pixel size. The hex distance folds at each edge, so its
+    // derivative blows up there and would paint the cells solid.
+    let px = max(length(fwidth(xz)), 0.0005);
+    return 1.0 - smoothstep(0.006, 0.006 + px * 1.25, dist);
+}
+
+fn checker(xz: vec2<f32>, cell: f32) -> f32 {
+    let id = floor(xz / cell);
+    return step(0.25, fract((id.x + id.y) * 0.5));
 }
 
 struct SkyOut {
@@ -247,18 +343,25 @@ pub struct Gpu {
     text_renderer: TextRenderer,
     labels: HashMap<(String, u32), Buffer>,
     text_warned: bool,
+    floor: Floor,
     pub(crate) window: Arc<Window>,
 }
 
 impl Gpu {
-    pub async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Result<Self, String> {
+    pub async fn new(
+        window: Arc<Window>,
+        event_loop: &ActiveEventLoop,
+        floor: Floor,
+    ) -> Result<Self, String> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(event_loop.owned_display_handle()),
         ));
         let surface = instance
             .create_surface(window.clone())
-            .map_err(|err| format!("could not open a Wayland surface: {err}"))?;
+            .map_err(|err| {
+                format!("could not open a Wayland surface, so the window has nothing to draw on. ({err})")
+            })?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -267,15 +370,15 @@ impl Gpu {
                 apply_limit_buckets: false,
             })
             .await
-            .map_err(|err| format!("no graphics adapter: {err}"))?;
+            .map_err(|err| format!("no GPU that can draw a Wayland window was found. ({err})"))?;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
-            .map_err(|err| format!("could not open the GPU: {err}"))?;
+            .map_err(|err| format!("a GPU was found, but it could not be opened. ({err})"))?;
 
         let caps = surface.get_capabilities(&adapter);
         if caps.formats.is_empty() {
-            return Err("the window surface has no color formats".into());
+            return Err("the window surface has no color format, so nothing can be drawn".into());
         }
         let format = caps
             .formats
@@ -368,6 +471,7 @@ impl Gpu {
                 resource: uniform_buffer.as_entire_binding(),
             }],
         });
+        let shader_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("nav"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -413,8 +517,14 @@ impl Gpu {
             &mesh_buffers,
         );
         let plate_pipeline = make_plate_pipeline(&device, &pipeline_layout, &shader, format);
+        if let Some(err) = shader_scope.pop().await {
+            return Err(format!(
+                "the GPU rejected a shader or pipeline, so the window would be blank. ({err})"
+            ));
+        }
 
         let font_system = FontSystem::new();
+        require_label_font(font_system.db())?;
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
@@ -452,6 +562,7 @@ impl Gpu {
             text_renderer,
             labels: HashMap::new(),
             text_warned: false,
+            floor,
             window,
         })
     }
@@ -474,7 +585,7 @@ impl Gpu {
         if self.config.width == 0 || self.config.height == 0 {
             return Ok(());
         }
-        let built = build_instances(frame);
+        let built = build_instances(frame, self.floor);
         self.ensure_instances(built.instances.len());
         self.queue
             .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&built.instances));
@@ -566,7 +677,7 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let shadow_count = frame.nodes.len() as u32;
+            let shadow_count = built.shadow_count;
             let ring_at = 1 + shadow_count;
             let mut shape_at = ring_at + 1;
             pass.set_pipeline(&self.sky_pipeline);
@@ -663,6 +774,9 @@ impl Gpu {
                 color: [0.02, 0.028, 0.04, 0.92],
             });
         }
+        for tile in &frame.tiles {
+            plates.extend(tile_plates(tile));
+        }
         plates
     }
 
@@ -696,6 +810,57 @@ impl Gpu {
                 label.color,
                 true,
             );
+        }
+        for tile in &frame.tiles {
+            self.push_text(
+                &mut drawn,
+                "←",
+                tile.arrow[0] + tile.arrow[2] * 0.5,
+                tile.arrow[1] + 4.0,
+                16.0,
+                [232, 236, 234],
+                true,
+            );
+            self.push_text(
+                &mut drawn,
+                &tile.name,
+                tile.arrow[0] + tile.arrow[2] + 8.0,
+                tile.rect[1] + 12.0,
+                15.0,
+                [244, 247, 246],
+                false,
+            );
+            self.push_text(
+                &mut drawn,
+                "×",
+                tile.close[0] + tile.close[2] * 0.5,
+                tile.close[1] + 3.0,
+                16.0,
+                [236, 224, 214],
+                true,
+            );
+            for (index, line) in tile.lines.iter().enumerate() {
+                self.push_text(
+                    &mut drawn,
+                    line,
+                    tile.rect[0] + 12.0,
+                    tile.rect[1] + 40.0 + index as f32 * 16.0,
+                    13.0,
+                    [168, 188, 190],
+                    false,
+                );
+            }
+            if tile.tag[2] > 0.0 {
+                self.push_text(
+                    &mut drawn,
+                    "Finished",
+                    tile.tag[0] + tile.tag[2] * 0.5,
+                    tile.tag[1] + 4.0,
+                    13.0,
+                    [214, 230, 222],
+                    true,
+                );
+            }
         }
         let used: HashSet<_> = drawn.iter().map(|item| item.key.clone()).collect();
         self.labels.retain(|key, _| used.contains(key));
@@ -780,9 +945,10 @@ impl Gpu {
 struct BuiltInstances {
     instances: Vec<InstanceRaw>,
     shape_counts: [u32; Shape::COUNT],
+    shadow_count: u32,
 }
 
-fn build_instances(frame: &Frame) -> BuiltInstances {
+fn build_instances(frame: &Frame, floor: Floor) -> BuiltInstances {
     let mut instances = Vec::with_capacity(frame.nodes.len() * 2 + 2);
     instances.push(InstanceRaw::new(
         Mat4::from_scale_rotation_translation(
@@ -791,9 +957,14 @@ fn build_instances(frame: &Frame) -> BuiltInstances {
             Vec3::new(0.0, -0.05, 0.0),
         ),
         [0.45, 0.72, 0.74, 1.0],
-        [frame.ground_radius, 0.0, 0.0, 0.0],
+        [frame.ground_radius, floor.code(), 0.0, 0.0],
     ));
+    let mut shadow_count = 0u32;
     for node in &frame.nodes {
+        if node.foot <= 0.0 {
+            continue;
+        }
+        shadow_count += 1;
         let pos = node.model.w_axis.truncate();
         let radius = (node.foot * 2.35).max(0.08);
         instances.push(InstanceRaw::new(
@@ -818,11 +989,12 @@ fn build_instances(frame: &Frame) -> BuiltInstances {
     ));
     let mut grouped: [Vec<InstanceRaw>; Shape::COUNT] = std::array::from_fn(|_| Vec::new());
     for node in &frame.nodes {
-        grouped[node.shape.index()].push(InstanceRaw::new(
-            node.model,
-            node.color,
-            [node.emissive, 0.0, 0.0, 0.0],
-        ));
+        let params = if node.arc[1] > 0.0 {
+            [node.emissive, node.arc[0], node.arc[1], 2.0]
+        } else {
+            [node.emissive, 0.0, 0.0, 0.0]
+        };
+        grouped[node.shape.index()].push(InstanceRaw::new(node.model, node.color, params));
     }
     let mut shape_counts = [0u32; Shape::COUNT];
     for (index, group) in grouped.iter().enumerate() {
@@ -832,6 +1004,7 @@ fn build_instances(frame: &Frame) -> BuiltInstances {
     BuiltInstances {
         instances,
         shape_counts,
+        shadow_count,
     }
 }
 
@@ -861,7 +1034,7 @@ fn shape_mesh(shape: Shape) -> geom::Mesh {
         Shape::Pyramid => geom::pyramid(),
         Shape::Crystal => geom::crystal(),
         Shape::Obelisk => geom::obelisk(),
-        Shape::Blob => geom::sphere(8, 12),
+        Shape::Blob => geom::ring_segment(24),
     }
 }
 
@@ -926,6 +1099,17 @@ const INSTANCE_ATTRS: [wgpu::VertexAttribute; 10] = wgpu::vertex_attr_array![
     11 => Float32x4,
 ];
 
+/// Folder names are drawn from the system font list. An empty list leaves the plaza unlabeled.
+fn require_label_font(db: &glyphon::fontdb::Database) -> Result<(), String> {
+    if !db.is_empty() {
+        return Ok(());
+    }
+    Err(
+        "no font was found, so folder names cannot be drawn. Install a sans-serif such as DejaVu Sans or Noto Sans where fontconfig can see it."
+            .into(),
+    )
+}
+
 fn make_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -977,6 +1161,47 @@ fn make_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn tile_plates(tile: &TileView) -> Vec<PlateRaw> {
+    let button = if_hot;
+    let mut plates = vec![
+        PlateRaw {
+            rect: tile.rect,
+            color: [0.025, 0.034, 0.05, 0.94],
+        },
+        PlateRaw {
+            rect: [tile.rect[0], tile.rect[1], 3.0, tile.rect[3]],
+            color: if tile.running {
+                [0.95, 0.72, 0.28, 1.0]
+            } else {
+                [0.38, 0.46, 0.48, 1.0]
+            },
+        },
+        PlateRaw {
+            rect: tile.arrow,
+            color: button(tile.arrow_hot),
+        },
+        PlateRaw {
+            rect: tile.close,
+            color: button(tile.close_hot),
+        },
+    ];
+    if tile.tag[2] > 0.0 {
+        plates.push(PlateRaw {
+            rect: tile.tag,
+            color: [0.16, 0.24, 0.22, 1.0],
+        });
+    }
+    plates
+}
+
+fn if_hot(hot: bool) -> [f32; 4] {
+    if hot {
+        [0.24, 0.28, 0.32, 1.0]
+    } else {
+        [0.07, 0.09, 0.12, 1.0]
+    }
 }
 
 fn buffer_width(buffer: &Buffer) -> f32 {
@@ -1053,5 +1278,20 @@ mod plate_tests {
         assert!(rect[1] < 80.0 + 4.0);
         assert!(rect[1] + rect[3] > 80.0 + 22.0);
         assert!(rect[2] < 90.0 + 40.0);
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::require_label_font;
+
+    #[test]
+    fn an_empty_font_list_stops_startup() {
+        let empty = glyphon::fontdb::Database::new();
+        let err = require_label_font(&empty).unwrap_err();
+        assert!(err.contains("no font was found"));
+        assert!(err.contains("DejaVu Sans"));
+        assert!(err.contains("Noto Sans"));
+        assert!(!err.starts_with("nav:"));
     }
 }

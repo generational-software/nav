@@ -9,6 +9,7 @@ const OPEN_SECONDS: f32 = 0.07;
 const UP_SECONDS: f32 = 0.10;
 const MISS_SECONDS: f32 = 0.04;
 const HOVER_SECONDS: f32 = 0.032;
+const COMMAND_SECONDS: f32 = 0.046;
 
 /// Which click just happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +22,8 @@ pub enum Tap {
     Miss,
     /// The pointer moved onto a folder.
     Hover,
+    /// The pointer moved onto a command. A clean chime, not the folder tap.
+    Command,
 }
 
 /// Plays taps on the default output. If that output cannot be opened, clicks stay silent.
@@ -30,6 +33,14 @@ pub struct Clicks {
 }
 
 impl Clicks {
+    /// No device is opened, and every tap is ignored.
+    pub fn silent() -> Self {
+        Self {
+            mixer: None,
+            _stream: None,
+        }
+    }
+
     pub fn start() -> Self {
         match open_output() {
             Ok((mixer, stream)) => Self {
@@ -38,10 +49,7 @@ impl Clicks {
             },
             Err(err) => {
                 eprintln!("nav: click sounds are off ({err})");
-                Self {
-                    mixer: None,
-                    _stream: None,
-                }
+                Self::silent()
             }
         }
     }
@@ -102,6 +110,7 @@ fn seconds(tap: Tap) -> f32 {
         Tap::Up => UP_SECONDS,
         Tap::Miss => MISS_SECONDS,
         Tap::Hover => HOVER_SECONDS,
+        Tap::Command => COMMAND_SECONDS,
     }
 }
 
@@ -112,18 +121,33 @@ pub fn sample_at(tap: Tap, t: f32, pitch: f32) -> f32 {
     if t < 0.0 || t >= dur {
         return 0.0;
     }
-    let (freq, decay, noise_mix, gain) = match tap {
-        Tap::Open => (250.0 + pitch * 130.0, 52.0, 0.42, 0.22),
-        Tap::Up => (118.0 + pitch * 36.0, 26.0, 0.18, 0.20),
-        Tap::Miss => (480.0 + pitch * 90.0, 64.0, 0.38, 0.16),
-        Tap::Hover => (520.0 + pitch * 180.0, 70.0, 0.28, 0.18),
-    };
+    match tap {
+        Tap::Command => command_chime(t, pitch, dur),
+        Tap::Open => tone(t, dur, 250.0 + pitch * 130.0, 52.0, 0.42, 0.22),
+        Tap::Up => tone(t, dur, 118.0 + pitch * 36.0, 26.0, 0.18, 0.20),
+        Tap::Miss => tone(t, dur, 480.0 + pitch * 90.0, 64.0, 0.38, 0.16),
+        Tap::Hover => tone(t, dur, 520.0 + pitch * 180.0, 70.0, 0.28, 0.18),
+    }
+}
+
+/// A noisy tap that falls in pitch. Used for clicks and the folder hover.
+fn tone(t: f32, dur: f32, freq: f32, decay: f32, noise_mix: f32, gain: f32) -> f32 {
     // Linear drop in pitch. Phase is the integral, so the tone stays continuous.
     let phase = std::f32::consts::TAU * freq * (t - 0.35 * t * t / (2.0 * dur));
     let body = phase.sin() + (phase * 2.35).sin() * 0.28;
     let noise = hash_noise((t * 48_000.0) as u32) * (-t * 260.0).exp();
     let env = (-t * decay).exp() * (1.0 - t / dur);
     (body * (1.0 - noise_mix) + noise * noise_mix) * env * gain
+}
+
+/// A clean fifth. The folder hover is a short noisy tone, so the two do not blur together.
+fn command_chime(t: f32, pitch: f32, dur: f32) -> f32 {
+    let root = 640.0 + pitch * 70.0;
+    let phase_a = std::f32::consts::TAU * root * t;
+    let phase_b = std::f32::consts::TAU * root * 1.5 * t;
+    let body = phase_a.sin() * 0.62 + phase_b.sin() * 0.42;
+    let env = (-t * 46.0).exp() * (1.0 - t / dur);
+    body * env * 0.16
 }
 
 fn hash_noise(n: u32) -> f32 {
@@ -233,8 +257,15 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_player_never_opens_the_output() {
+        let clicks = Clicks::silent();
+        assert!(!clicks.is_live());
+        clicks.play(Tap::Open, 0.5);
+    }
+
+    #[test]
     fn each_tap_attacks_and_then_falls_silent() {
-        for tap in [Tap::Open, Tap::Up, Tap::Miss, Tap::Hover] {
+        for tap in [Tap::Open, Tap::Up, Tap::Miss, Tap::Hover, Tap::Command] {
             let samples = render(tap, 0.4);
             let peak = samples.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
             assert!(peak > 0.04 && peak < 0.55, "{tap:?} peak {peak}");
@@ -254,9 +285,12 @@ mod tests {
         assert!(open.len() < up.len(), "going up rings a little longer");
         assert!(miss.len() < open.len(), "an empty click is the short one");
         let hover = render(Tap::Hover, 0.4);
-        assert!(hover.len() < miss.len(), "a mouse-over is the shortest tap");
+        assert!(hover.len() < miss.len(), "a folder mouse-over is the shortest tap");
         assert_ne!(hover, open);
         assert!(energy(&open) > energy(&hover));
+        let command = render(Tap::Command, 0.4);
+        assert_ne!(command, hover, "a command mouse-over is not the folder tap");
+        assert!(command.len() > hover.len());
         assert!(energy(&open) > energy(&miss));
         assert_ne!(render(Tap::Open, 0.1), render(Tap::Open, 0.9));
     }
@@ -273,6 +307,8 @@ mod tests {
         clicks.play(Tap::Miss, 0.5);
         std::thread::sleep(std::time::Duration::from_millis(180));
         clicks.play(Tap::Hover, 0.7);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        clicks.play(Tap::Command, 0.4);
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }

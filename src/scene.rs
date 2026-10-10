@@ -1,20 +1,32 @@
 //! The plaza of folders, and the ray that picks one.
 
 use std::collections::HashMap;
-use std::f32::consts::{FRAC_PI_2, TAU};
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glam::{Mat4, Quat, Vec3, Vec4};
 
 use crate::commands::Command;
-use crate::geom::{RING_INNER, RING_OUTER};
+use crate::geom::{SEGMENT_INNER, SEGMENT_OUTER};
+use crate::jobs::{JobView, Jobs};
 use crate::mark::{NavMark, Shape};
 use crate::scan::{ScanEvent, Scanner};
 
 const MAX_SHOWN: usize = 240;
 const MAX_GRANDS: usize = 4;
-const HELP: &str = "Drag to look around. Scroll to zoom. Click a folder to open it. Backspace goes up. H toggles dot folders. Escape exits.";
+const HELP: &str = "Drag to look around. Scroll to zoom. Click a folder to open it. Click a command to run it. Backspace goes up. H toggles dot folders. Escape exits.";
+
+/// Tiles sit under the path title, stacked down the left of the window.
+const TILE_W: f32 = 300.0;
+const TILE_H: f32 = 96.0;
+const TILE_X: f32 = 22.0;
+const TILE_Y0: f32 = 92.0;
+const TILE_GAP: f32 = 8.0;
+const FINISHED_TAG_W: f32 = 84.0;
+const FINISHED_TAG_H: f32 = 22.0;
+/// Extra frame height so the Finished tag sits under the output.
+const FINISHED_EXTRA: f32 = 32.0;
 
 /// The "you are here" ring. The mesh is one unit tall, so the lip of the
 /// opening is at `HERE_RING_Y + HERE_RING_HEIGHT`.
@@ -22,6 +34,10 @@ pub(crate) const HERE_RING_Y: f32 = 0.02;
 pub(crate) const HERE_RING_HEIGHT: f32 = 0.045;
 /// Instance scale of the unit ring. The pulse in the renderer adds a little on top.
 pub(crate) const HERE_RING_SCALE: f32 = 1.62;
+/// A command segment is this many times as tall as the ring.
+const SEGMENT_THICK: f32 = 3.6;
+/// Share of the circle each command keeps. The rest stays the thin ring.
+const SEGMENT_FILL: f32 = 0.7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -112,6 +128,12 @@ struct Placed {
     foot: f32,
     shape: Shape,
     pickable: bool,
+    /// Center angle and sweep, in radians. A sweep of 0 is an ordinary stone.
+    arc: [f32; 2],
+    /// Index into the open folder's command list. Set only for a ring segment.
+    command: Option<usize>,
+    /// This segment's command is running in the open folder.
+    running: bool,
 }
 
 struct Arrangement {
@@ -127,6 +149,7 @@ pub struct NodeDraw {
     pub emissive: f32,
     pub foot: f32,
     pub shape: Shape,
+    pub arc: [f32; 2],
 }
 
 pub struct ScreenLabel {
@@ -137,18 +160,58 @@ pub struct ScreenLabel {
     pub color: [u8; 3],
 }
 
+/// One command, drawn as a rectangle on the left.
+pub struct TileView {
+    pub id: u64,
+    pub name: String,
+    pub lines: Vec<String>,
+    pub running: bool,
+    /// Set once the command has exited. The tag rect is then at the bottom of `rect`.
+    pub finished: bool,
+    pub rect: [f32; 4],
+    pub arrow: [f32; 4],
+    pub close: [f32; 4],
+    /// Screen rect of the Finished tag. Zero when the command has not exited.
+    pub tag: [f32; 4],
+    pub arrow_hot: bool,
+    pub close_hot: bool,
+}
+
 pub struct Frame {
     pub nodes: Vec<NodeDraw>,
     pub ground_radius: f32,
     pub ring_emissive: f32,
     pub time: f32,
     pub labels: Vec<ScreenLabel>,
+    pub tiles: Vec<TileView>,
     pub title: String,
     pub meta: String,
     pub help: String,
     pub pointer: bool,
     pub view_proj: Mat4,
     pub camera_pos: Vec3,
+}
+
+/// What a click on the current aim should do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Click {
+    /// The pointer was over empty ground.
+    Miss,
+    /// The pointer was on a tile, but not on a control.
+    Quiet,
+    /// A folder opened. `up` is the parent stone.
+    Opened { up: bool },
+    /// A command started, or its tile was closed.
+    Acted,
+}
+
+#[derive(Clone, Debug)]
+enum Aim {
+    Folder(PathBuf),
+    Command { index: usize, name: String },
+    Back(u64),
+    Kill(u64),
+    Tile,
 }
 
 pub struct Navigator {
@@ -159,12 +222,14 @@ pub struct Navigator {
     scanner: Scanner,
     camera: Camera,
     user_zoomed: bool,
-    hover: Option<PathBuf>,
+    aim: Option<Aim>,
+    jobs: Jobs,
     show_dots: bool,
 }
 
 impl Navigator {
-    pub fn open(path: PathBuf) -> Self {
+    /// `show_dots` is the starting visibility of folders whose names start with a dot. H still toggles it.
+    pub fn open(path: PathBuf, show_dots: bool) -> Self {
         let mut nav = Self {
             current: path.clone(),
             dirs: HashMap::new(),
@@ -173,8 +238,9 @@ impl Navigator {
             scanner: Scanner::spawn(),
             camera: Camera::default(),
             user_zoomed: false,
-            hover: None,
-            show_dots: true,
+            aim: None,
+            jobs: Jobs::new(),
+            show_dots,
         };
         nav.request_scan(&path);
         nav
@@ -185,6 +251,7 @@ impl Navigator {
         for event in events {
             self.apply(event);
         }
+        self.jobs.poll();
     }
 
     pub fn navigate(&mut self, path: PathBuf) {
@@ -193,7 +260,7 @@ impl Navigator {
         }
         self.current = path;
         self.user_zoomed = false;
-        self.hover = None;
+        self.aim = None;
         let current = self.current.clone();
         self.request_scan(&current);
         self.schedule_children();
@@ -213,22 +280,34 @@ impl Navigator {
     }
 
     pub fn hovered_path(&self) -> Option<&Path> {
-        self.hover.as_deref()
+        match &self.aim {
+            Some(Aim::Folder(path)) => Some(path),
+            _ => None,
+        }
     }
 
-    pub fn hovered_is_parent(&self) -> bool {
-        let Some(path) = &self.hover else {
-            return false;
-        };
-        self.current.parent() == Some(path.as_path())
+    /// Folder or command under the pointer, so a hover tap plays once per arrival.
+    pub fn hover_key(&self) -> Option<String> {
+        match &self.aim {
+            Some(Aim::Folder(path)) => Some(format!("dir:{}", path.display())),
+            Some(Aim::Command { name, .. }) => Some(format!("cmd:{name}")),
+            _ => None,
+        }
     }
 
-    /// A stable 0 to 1 tone for the stone under the pointer.
+    /// The pointer is on a command segment, so the hover chime is not the folder tap.
+    pub fn hover_is_command(&self) -> bool {
+        matches!(self.aim, Some(Aim::Command { .. }))
+    }
+
+    /// A stable 0 to 1 tone for the stone or command under the pointer.
     pub fn hover_pitch(&self) -> f32 {
-        let Some(path) = &self.hover else {
-            return 0.35;
+        let key = match &self.aim {
+            Some(Aim::Folder(path)) => path.to_string_lossy().into_owned(),
+            Some(Aim::Command { name, .. }) => name.clone(),
+            _ => return 0.35,
         };
-        (fnv(&path.to_string_lossy()) % 1000) as f32 / 999.0
+        (fnv(&key) % 1000) as f32 / 999.0
     }
 
     /// Show or hide folders whose names start with a dot. The scan itself keeps them.
@@ -259,16 +338,53 @@ impl Navigator {
         self.schedule_children();
     }
 
-    pub fn activate(&mut self) -> bool {
-        let Some(path) = self.hover.clone() else {
+    pub fn activate(&mut self) -> Click {
+        match self.aim.clone() {
+            Some(Aim::Folder(path)) => {
+                let up = self.current.parent() == Some(path.as_path());
+                let before = self.current.clone();
+                self.navigate(path);
+                if self.current != before {
+                    Click::Opened { up }
+                } else {
+                    Click::Miss
+                }
+            }
+            Some(Aim::Command { index, .. }) => {
+                if self.launch(index) {
+                    Click::Acted
+                } else {
+                    Click::Quiet
+                }
+            }
+            Some(Aim::Back(id)) => {
+                let Some(dir) = self.jobs.dir_of(id) else {
+                    return Click::Quiet;
+                };
+                let before = self.current.clone();
+                self.navigate(dir);
+                if self.current != before {
+                    Click::Opened { up: false }
+                } else {
+                    Click::Quiet
+                }
+            }
+            Some(Aim::Kill(id)) => {
+                self.jobs.close(id);
+                Click::Acted
+            }
+            Some(Aim::Tile) => Click::Quiet,
+            None => Click::Miss,
+        }
+    }
+
+    fn launch(&mut self, index: usize) -> bool {
+        let current = self.current.clone();
+        let commands = self.commands_of(&current);
+        let Some(command) = commands.get(index) else {
             return false;
         };
-        if path == self.current {
-            return false;
-        }
-        let before = self.current.clone();
-        self.navigate(path);
-        self.current != before
+        self.jobs.start(&command.name, &current, &command.line).is_some()
     }
 
     pub fn orbit(&mut self, dyaw: f32, dpitch: f32) {
@@ -295,6 +411,7 @@ impl Navigator {
 
     pub fn build_frame(
         &mut self,
+        cursor: Option<(f32, f32)>,
         ray: Option<(Vec3, Vec3)>,
         width: f32,
         height: f32,
@@ -305,18 +422,54 @@ impl Navigator {
         let aspect = if height > 1.0 { width / height } else { 1.0 };
         let view_proj = self.camera.view_proj(aspect);
         let camera_pos = self.camera.eye();
-        self.hover = ray.and_then(|(origin, dir)| {
-            pick(&arranged.nodes, origin, dir).map(|node| node.path.clone())
-        });
-        if let Some(path) = self.hover.clone() {
-            for node in &mut arranged.nodes {
-                if node.pickable && node.path == path {
-                    node.color = [0.98, 0.86, 0.55, 1.0];
-                    node.emissive = 0.55;
+        let mut tiles = self.tile_views(width);
+        let tile_aim = cursor.and_then(|(x, y)| aim_tile(x, y, &tiles));
+        self.aim = if tile_aim.is_some() {
+            tile_aim
+        } else {
+            ray.and_then(|(origin, dir)| aim_node(&arranged.nodes, origin, dir))
+        };
+        for tile in &mut tiles {
+            tile.arrow_hot = matches!(&self.aim, Some(Aim::Back(id)) if *id == tile.id);
+            tile.close_hot = matches!(&self.aim, Some(Aim::Kill(id)) if *id == tile.id);
+        }
+        match &self.aim {
+            Some(Aim::Folder(path)) => {
+                for node in &mut arranged.nodes {
+                    if node.command.is_none() && node.pickable && node.path == *path {
+                        node.color = [0.98, 0.86, 0.55, 1.0];
+                        node.emissive = 0.55;
+                    }
                 }
             }
+            Some(Aim::Command { index, .. }) => {
+                if let Some(node) = arranged
+                    .nodes
+                    .iter_mut()
+                    .filter(|node| node.command.is_some())
+                    .nth(*index)
+                {
+                    node.color = [1.0, 0.90, 0.62, 1.0];
+                    node.emissive = 0.62;
+                }
+            }
+            _ => {}
         }
-        let labels = place_labels(&arranged.nodes, &self.current, view_proj, width, height, &self.hover);
+        for node in &mut arranged.nodes {
+            if !node.running {
+                continue;
+            }
+            let hovered = matches!(
+                &self.aim,
+                Some(Aim::Command { index, .. }) if node.command == Some(*index)
+            );
+            style_running(node, time, hovered);
+        }
+        let folder_hover = match &self.aim {
+            Some(Aim::Folder(path)) => Some(path.clone()),
+            _ => None,
+        };
+        let labels = place_labels(&arranged.nodes, &self.current, view_proj, width, height, &folder_hover);
         let title_cols = ((width - 64.0) / 14.0).floor() as usize;
         let title = ellipsize_middle(&self.current.display().to_string(), title_cols.max(12));
         let meta = self.meta_line(arranged.shown, arranged.total, width);
@@ -333,19 +486,36 @@ impl Navigator {
                     emissive: node.emissive,
                     foot: node.foot,
                     shape: node.shape,
+                    arc: node.arc,
                 })
                 .collect(),
             ground_radius: arranged.outer + 8.0,
             ring_emissive: 0.3 + amp * (time * rate).sin(),
             time,
             labels,
+            tiles,
             title,
             meta,
             help: HELP.to_string(),
-            pointer: self.hover.is_some(),
+            pointer: matches!(
+                self.aim,
+                Some(Aim::Folder(_) | Aim::Command { .. } | Aim::Back(_) | Aim::Kill(_))
+            ),
             view_proj,
             camera_pos,
         }
+    }
+
+    fn tile_views(&self, width: f32) -> Vec<TileView> {
+        let width = TILE_W.min((width - TILE_X - 16.0).max(180.0));
+        let mut top = TILE_Y0;
+        let mut tiles = Vec::new();
+        for job in self.jobs.views() {
+            let tile = tile_view(top, width, job, &self.current);
+            top += tile.rect[3] + TILE_GAP;
+            tiles.push(tile);
+        }
+        tiles
     }
 
     pub fn ray(&self, x: f32, y: f32, width: f32, height: f32) -> Option<(Vec3, Vec3)> {
@@ -480,7 +650,7 @@ impl Navigator {
         let (order, total) = {
             let Some(rec) = self.dirs.get(&current) else {
                 let mut arranged = arrange_full(parent.as_deref(), parent_mark, &[], time);
-                self.attach_commands(&mut arranged);
+                self.attach_commands(&mut arranged, time);
                 return arranged;
             };
             let mut order = visible_order(&rec.children, self.show_dots);
@@ -524,14 +694,15 @@ impl Navigator {
         let mut arranged = arrange_full(parent.as_deref(), parent_mark, &children, time);
         arranged.total = total;
         arranged.shown = shown;
-        self.attach_commands(&mut arranged);
+        self.attach_commands(&mut arranged, time);
         arranged
     }
 
-    fn attach_commands(&mut self, arranged: &mut Arrangement) {
+    fn attach_commands(&mut self, arranged: &mut Arrangement, time: f32) {
         let current = self.current.clone();
         let commands = self.commands_of(&current);
-        place_commands(&mut arranged.nodes, &commands);
+        let running = self.jobs.running_names(&current);
+        place_commands(&mut arranged.nodes, &commands, time, &running);
     }
 
     fn commands_of(&mut self, path: &Path) -> Vec<Command> {
@@ -628,7 +799,7 @@ impl Navigator {
         if !self.show_dots {
             line.push_str(" · dot folders hidden");
         }
-        if let Some(path) = &self.hover {
+        if let Some(path) = self.hovered_path() {
             let cols = ((width - 64.0) / 9.0).floor() as usize;
             let shown_path = ellipsize_middle(&path.display().to_string(), cols.max(16));
             line = format!("{shown_path} · {line}");
@@ -842,34 +1013,62 @@ fn stone(
         foot: radius,
         shape,
         pickable: radius > 0.03 && height > 0.03,
+        arc: [0.0, 0.0],
+        command: None,
+        running: false,
     }
 }
 
-fn place_commands(nodes: &mut Vec<Placed>, commands: &[Command]) {
+fn place_commands(nodes: &mut Vec<Placed>, commands: &[Command], time: f32, running: &[String]) {
     let count = commands.len();
     if count == 0 {
         return;
     }
-    let mid = HERE_RING_SCALE * (RING_INNER + RING_OUTER) * 0.5;
-    let gap = TAU * mid / count as f32;
-    let diameter = (gap * 0.55).clamp(0.12, 0.28);
-    let lip = HERE_RING_Y + HERE_RING_HEIGHT;
+    let pulse = HERE_RING_SCALE + (time.sin() * 0.035);
+    let sweep = TAU / count as f32 * SEGMENT_FILL;
+    let mid = pulse * (SEGMENT_INNER + SEGMENT_OUTER) * 0.5;
     for (index, command) in commands.iter().enumerate() {
+        let live = running.iter().any(|name| name == &command.name);
+        let breathe = if live { 1.0 + (time * 3.2).sin() * 0.045 } else { 1.0 };
+        let height = HERE_RING_HEIGHT * SEGMENT_THICK * if live { 1.22 * breathe } else { 1.0 };
+        let base_y = if live { HERE_RING_Y + 0.012 } else { HERE_RING_Y };
         let angle = -FRAC_PI_2 + index as f32 * TAU / count as f32;
-        let mut node = stone(
-            Kind::Command,
-            PathBuf::new(),
-            short_name(&command.name, 20),
-            Vec3::new(angle.cos() * mid, lip, angle.sin() * mid),
-            diameter * 0.5,
-            diameter,
-            [0.95, 0.72, 0.28, 1.0],
-            0.22,
-            0.0,
-            Shape::Blob,
-        );
-        node.pickable = false;
+        let mut node = Placed {
+            kind: Kind::Command,
+            path: PathBuf::new(),
+            label: short_name(&command.name, 20),
+            center: Vec3::new(angle.cos() * mid, base_y + height * 0.5, angle.sin() * mid),
+            half: Vec3::new(0.2, height * 0.5, 0.2),
+            model: Mat4::from_scale_rotation_translation(
+                Vec3::new(pulse, height, pulse),
+                Quat::IDENTITY,
+                Vec3::new(0.0, base_y, 0.0),
+            ),
+            color: [0.95, 0.72, 0.28, 1.0],
+            emissive: 0.22,
+            foot: 0.0,
+            shape: Shape::Blob,
+            pickable: true,
+            arc: [angle, sweep],
+            command: Some(index),
+            running: live,
+        };
+        if live {
+            style_running(&mut node, time, false);
+        }
         nodes.push(node);
+    }
+}
+
+/// A running segment stays brighter than its neighbours and keeps a slow pulse.
+fn style_running(node: &mut Placed, time: f32, hovered: bool) {
+    let pulse = (time * 3.2).sin();
+    if hovered {
+        node.color = [1.0, 0.94, 0.68, 1.0];
+        node.emissive = 0.84 + pulse * 0.1;
+    } else {
+        node.color = [1.0, 0.84, 0.34, 1.0];
+        node.emissive = 0.62 + pulse * 0.22;
     }
 }
 
@@ -944,6 +1143,7 @@ fn place_labels(
             Kind::Child => (16.0, [236, 244, 242], 2),
             Kind::Grandchild if hovered => (14.0, [255, 244, 214], 1),
             Kind::Grandchild => (13.0, [186, 208, 210], 3),
+            Kind::Command if node.running => (15.0, [255, 236, 196], 1),
             Kind::Command => (15.0, [255, 236, 210], 1),
         };
         pending.push(PendingLabel {
@@ -1024,9 +1224,12 @@ fn pick<'a>(nodes: &'a [Placed], origin: Vec3, dir: Vec3) -> Option<&'a Placed> 
         if !node.pickable {
             continue;
         }
-        let min = node.center - node.half;
-        let max = node.center + node.half;
-        let Some(t) = ray_aabb(origin, dir, min, max) else {
+        let hit = if node.command.is_some() {
+            ray_sector(origin, dir, node)
+        } else {
+            ray_aabb(origin, dir, node.center - node.half, node.center + node.half)
+        };
+        let Some(t) = hit else {
             continue;
         };
         if best.is_none_or(|(_, best_t)| t < best_t) {
@@ -1034,6 +1237,156 @@ fn pick<'a>(nodes: &'a [Placed], origin: Vec3, dir: Vec3) -> Option<&'a Placed> 
         }
     }
     best.map(|(node, _)| node)
+}
+
+fn aim_node(nodes: &[Placed], origin: Vec3, dir: Vec3) -> Option<Aim> {
+    let node = pick(nodes, origin, dir)?;
+    if let Some(index) = node.command {
+        Some(Aim::Command {
+            index,
+            name: node.label.clone(),
+        })
+    } else {
+        Some(Aim::Folder(node.path.clone()))
+    }
+}
+
+/// The segment is an annular slice. A downward ray hits its top; a shallower one can hit the wall.
+fn ray_sector(origin: Vec3, dir: Vec3, node: &Placed) -> Option<f32> {
+    let y0 = node.center.y - node.half.y;
+    let y1 = node.center.y + node.half.y;
+    if dir.y.abs() > 1e-6 {
+        let mut best: Option<f32> = None;
+        for y in [y0, y1] {
+            let t = (y - origin.y) / dir.y;
+            if t < 0.0 {
+                continue;
+            }
+            if point_in_sector(origin + dir * t, node) && best.is_none_or(|best_t| t < best_t) {
+                best = Some(t);
+            }
+        }
+        if let Some(t) = best {
+            return Some(t);
+        }
+    }
+    let (mut t, t1) = y_span(origin.y, dir.y, y0, y1)?;
+    for _ in 0..80 {
+        if t > t1 {
+            break;
+        }
+        if point_in_sector(origin + dir * t, node) {
+            return Some(t);
+        }
+        t += 0.03;
+    }
+    None
+}
+
+fn y_span(origin_y: f32, dir_y: f32, y0: f32, y1: f32) -> Option<(f32, f32)> {
+    if dir_y.abs() < 1e-6 {
+        if (y0..=y1).contains(&origin_y) {
+            Some((0.0, 40.0))
+        } else {
+            None
+        }
+    } else {
+        let mut t0 = (y0 - origin_y) / dir_y;
+        let mut t1 = (y1 - origin_y) / dir_y;
+        if t0 > t1 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        if t1 < 0.0 {
+            None
+        } else {
+            Some((t0.max(0.0), t1))
+        }
+    }
+}
+
+fn point_in_sector(point: Vec3, node: &Placed) -> bool {
+    let mid = (node.center.x * node.center.x + node.center.z * node.center.z).sqrt();
+    let unit = (SEGMENT_INNER + SEGMENT_OUTER) * 0.5;
+    if mid < 1e-4 {
+        return false;
+    }
+    let pulse = mid / unit;
+    let radial = (point.x * point.x + point.z * point.z).sqrt();
+    if radial + 0.002 < pulse * SEGMENT_INNER || radial - 0.002 > pulse * SEGMENT_OUTER {
+        return false;
+    }
+    let angle = point.z.atan2(point.x);
+    angle_delta(node.arc[0], angle).abs() <= node.arc[1] * 0.5 + 0.02
+}
+
+fn angle_delta(from: f32, to: f32) -> f32 {
+    let mut delta = (to - from + PI) % TAU;
+    if delta < 0.0 {
+        delta += TAU;
+    }
+    delta - PI
+}
+
+fn tile_view(top: f32, width: f32, job: JobView, here: &Path) -> TileView {
+    let height = if job.finished { TILE_H + FINISHED_EXTRA } else { TILE_H };
+    let rect = [TILE_X, top, width, height];
+    let arrow = [rect[0] + 10.0, rect[1] + 8.0, 26.0, 26.0];
+    let close = [rect[0] + rect[2] - 36.0, rect[1] + 8.0, 26.0, 26.0];
+    let name_left = arrow[0] + arrow[2] + 8.0;
+    let name_width = (close[0] - 8.0 - name_left).max(24.0);
+    let line_width = (rect[2] - 24.0).max(24.0);
+    let title = if job.dir == here {
+        job.name
+    } else {
+        format!("{} · {}", job.name, display_name(&job.dir))
+    };
+    let tag = if job.finished {
+        [
+            rect[0] + 12.0,
+            rect[1] + rect[3] - 8.0 - FINISHED_TAG_H,
+            FINISHED_TAG_W,
+            FINISHED_TAG_H,
+        ]
+    } else {
+        [0.0; 4]
+    };
+    TileView {
+        id: job.id,
+        name: fit_text(&title, 15.0, name_width),
+        lines: job.lines.into_iter().map(|line| fit_text(&line, 13.0, line_width)).collect(),
+        running: job.running,
+        finished: job.finished,
+        rect,
+        arrow,
+        close,
+        tag,
+        arrow_hot: false,
+        close_hot: false,
+    }
+}
+
+fn aim_tile(x: f32, y: f32, tiles: &[TileView]) -> Option<Aim> {
+    for tile in tiles.iter().rev() {
+        if inside(x, y, tile.close) {
+            return Some(Aim::Kill(tile.id));
+        }
+        if inside(x, y, tile.arrow) {
+            return Some(Aim::Back(tile.id));
+        }
+        if inside(x, y, tile.rect) {
+            return Some(Aim::Tile);
+        }
+    }
+    None
+}
+
+fn inside(x: f32, y: f32, rect: [f32; 4]) -> bool {
+    x >= rect[0] && y >= rect[1] && x < rect[0] + rect[2] && y < rect[1] + rect[3]
+}
+
+fn fit_text(text: &str, size: f32, width: f32) -> String {
+    let max = ((width / (size * 0.52)).floor() as usize).max(1);
+    short_name(text, max)
 }
 
 fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
@@ -1185,6 +1538,63 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_tile_keeps_its_tag_at_the_bottom() {
+        let here = PathBuf::from("/tmp/plaza");
+        let live = tile_view(
+            TILE_Y0,
+            TILE_W,
+            JobView {
+                id: 1,
+                name: "ping".into(),
+                dir: here.clone(),
+                lines: vec!["hello".into()],
+                running: true,
+                finished: false,
+            },
+            &here,
+        );
+        assert!(!live.finished);
+        assert_eq!(live.tag, [0.0; 4]);
+        assert!((live.rect[3] - TILE_H).abs() < 0.1);
+
+        let done = tile_view(
+            TILE_Y0,
+            TILE_W,
+            JobView {
+                id: 1,
+                name: "ping".into(),
+                dir: here.clone(),
+                lines: vec!["hello".into()],
+                running: false,
+                finished: true,
+            },
+            &here,
+        );
+        assert!(done.finished);
+        assert!(done.rect[3] > TILE_H + 20.0);
+        assert!(done.tag[1] >= done.rect[1] + TILE_H - 1.0);
+        assert!(done.tag[1] + done.tag[3] <= done.rect[1] + done.rect[3] + 0.1);
+        assert!(done.tag[0] >= done.rect[0]);
+        assert!(done.tag[0] + done.tag[2] <= done.rect[0] + done.rect[2]);
+
+        let next = tile_view(
+            done.rect[1] + done.rect[3] + TILE_GAP,
+            TILE_W,
+            JobView {
+                id: 2,
+                name: "slow".into(),
+                dir: here,
+                lines: vec!["running".into()],
+                running: true,
+                finished: false,
+            },
+            Path::new("/tmp/plaza"),
+        );
+        assert!(!next.finished);
+        assert!(next.rect[1] + 0.1 >= done.rect[1] + done.rect[3] + TILE_GAP);
+    }
+
+    #[test]
     fn ray_hits_the_stone_in_front_and_misses_empty_ground() {
         let path = PathBuf::from("/alpha");
         let node = stone(
@@ -1310,7 +1720,7 @@ mod tests {
         fs::write(root.join("chart.txt"), b"nope").unwrap();
         std::os::unix::fs::symlink("atlas", root.join("link_atlas")).unwrap();
 
-        let mut nav = Navigator::open(root.clone());
+        let mut nav = Navigator::open(root.clone(), false);
         let start = Instant::now();
         let mut saw_grand = false;
         while start.elapsed() < Duration::from_secs(5) {
@@ -1341,8 +1751,8 @@ mod tests {
         assert!(link.symlink);
         assert_eq!(nav.dirs.get(&root.join("link_atlas")).unwrap().status, ScanStatus::Idle);
 
-        nav.hover = Some(root.join("atlas"));
-        assert!(nav.activate());
+        nav.aim = Some(Aim::Folder(root.join("atlas")));
+        assert!(matches!(nav.activate(), Click::Opened { up: false }));
         assert_eq!(nav.current, root.join("atlas"));
 
         let start = Instant::now();
@@ -1382,7 +1792,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut nav = Navigator::open(root.clone());
+        let mut nav = Navigator::open(root.clone(), false);
         let start = Instant::now();
         let red = mark::parse_colour("red").unwrap();
         loop {
@@ -1415,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_commands_sit_on_the_center_ring_and_are_not_clickable() {
+    fn manifest_commands_are_pickable_slices_of_the_center_ring() {
         let tmp = Tmp::new();
         let root = tmp.0.join("plaza");
         fs::create_dir_all(&root).unwrap();
@@ -1430,28 +1840,40 @@ mod tests {
         )
         .unwrap();
 
-        let mut nav = Navigator::open(root.clone());
+        let mut nav = Navigator::open(root.clone(), false);
         let arranged = nav.layout(0.0);
         let commands: Vec<_> = arranged.nodes.iter().filter(|node| node.kind == Kind::Command).collect();
         let labels: Vec<_> = commands.iter().map(|node| node.label.as_str()).collect();
         assert_eq!(labels, ["serve", "demo", "dev", "test"]);
-        let mid = HERE_RING_SCALE * (RING_INNER + RING_OUTER) * 0.5;
-        let lip = HERE_RING_Y + HERE_RING_HEIGHT;
+        let mid = HERE_RING_SCALE * (SEGMENT_INNER + SEGMENT_OUTER) * 0.5;
+        let height = HERE_RING_HEIGHT * 3.6;
+        let sweep = TAU / 4.0 * 0.7;
         for node in &commands {
             let radial = (node.center.x * node.center.x + node.center.z * node.center.z).sqrt();
             assert!((radial - mid).abs() < 0.02, "radial {radial}");
-            assert!((node.center.y - node.half.y - lip).abs() < 0.001);
-            assert!(!node.pickable);
+            assert!((node.center.y - node.half.y - HERE_RING_Y).abs() < 0.001);
+            assert!((node.half.y * 2.0 - height).abs() < 0.001);
+            assert!(height > HERE_RING_HEIGHT);
+            assert!((node.arc[1] - sweep).abs() < 0.001);
+            assert!(node.pickable);
+            assert_eq!(node.command, Some(commands.iter().position(|other| other.label == node.label).unwrap()));
             assert!(node.path.as_os_str().is_empty());
             assert_eq!(node.shape, Shape::Blob);
-            assert!((node.half.x - node.half.y).abs() < 0.001, "a blob stays round");
+            assert_eq!(node.foot, 0.0);
         }
         let hit = pick(
             &arranged.nodes,
             Vec3::new(commands[0].center.x, 4.0, commands[0].center.z),
             Vec3::new(0.0, -1.0, 0.0),
         );
-        assert!(hit.is_none());
+        assert_eq!(hit.map(|node| node.label.as_str()), Some("serve"));
+        let gap = -FRAC_PI_2 + TAU / 8.0;
+        let missed = pick(
+            &arranged.nodes,
+            Vec3::new(gap.cos() * mid, 4.0, gap.sin() * mid),
+            Vec3::new(0.0, -1.0, 0.0),
+        );
+        assert!(missed.is_none(), "the pale ring between segments is not a command");
 
         fs::write(root.join("Cargo.toml"), "[package]\nname = \"plaza\"\n").unwrap();
         fs::write(root.join("package.json"), r#"{"scripts":{"build":"tsc"}}"#).unwrap();
@@ -1467,6 +1889,182 @@ mod tests {
     }
 
     #[test]
+    fn a_running_command_marks_only_its_own_segment() {
+        let tmp = Tmp::new();
+        let root = tmp.0.join("plaza");
+        let side = root.join("side");
+        fs::create_dir_all(&side).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"ping":"sleep 30","pong":"sleep 30"}}"#,
+        )
+        .unwrap();
+        fs::write(side.join("package.json"), r#"{"scripts":{"ping":"sleep 30"}}"#).unwrap();
+
+        let mut nav = Navigator::open(root.clone(), false);
+        let arranged = nav.layout(0.0);
+        let ping = arranged.nodes.iter().find(|node| node.label == "ping").unwrap();
+        let ray = Some((Vec3::new(ping.center.x, 5.0, ping.center.z), Vec3::new(0.0, -1.0, 0.0)));
+        nav.build_frame(None, ray, 900.0, 700.0, 0.0);
+        assert!(matches!(nav.activate(), Click::Acted));
+
+        let arranged = nav.layout(0.0);
+        let ping = arranged.nodes.iter().find(|node| node.label == "ping").unwrap();
+        let pong = arranged.nodes.iter().find(|node| node.label == "pong").unwrap();
+        assert!(ping.running);
+        assert!(!pong.running);
+        assert!(ping.half.y > pong.half.y + 0.004);
+        assert!(ping.emissive > pong.emissive + 0.2);
+
+        let frame = nav.build_frame(None, None, 900.0, 700.0, 0.0);
+        let mut glows: Vec<f32> = frame
+            .nodes
+            .iter()
+            .filter(|node| node.shape == Shape::Blob)
+            .map(|node| node.emissive)
+            .collect();
+        glows.sort_by(|a, b| a.total_cmp(b));
+        assert!(glows.len() >= 2);
+        assert!(glows[glows.len() - 1] > glows[0] + 0.2);
+
+        nav.navigate(side.clone());
+        let arranged = nav.layout(0.0);
+        let ping = arranged.nodes.iter().find(|node| node.label == "ping").unwrap();
+        assert!(!ping.running, "a command in another folder is a different task");
+
+        nav.navigate(root);
+        let arranged = nav.layout(0.0);
+        assert!(arranged.nodes.iter().find(|node| node.label == "ping").unwrap().running);
+        assert!(!arranged.nodes.iter().find(|node| node.label == "pong").unwrap().running);
+    }
+
+    #[test]
+    fn clicking_a_command_runs_it_and_the_tile_can_return_and_close() {
+        let tmp = Tmp::new();
+        let root = tmp.0.join("plaza");
+        let side = root.join("side");
+        fs::create_dir_all(&side).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"ping":"echo hello-from-nav","pong":"echo again"}}"#,
+        )
+        .unwrap();
+
+        let mut nav = Navigator::open(root.clone(), false);
+        let arranged = nav.layout(0.0);
+        let ping = arranged.nodes.iter().find(|node| node.label == "ping").unwrap();
+        let pong = arranged.nodes.iter().find(|node| node.label == "pong").unwrap();
+        let ping_ray = Some((Vec3::new(ping.center.x, 5.0, ping.center.z), Vec3::new(0.0, -1.0, 0.0)));
+        let pong_ray = Some((Vec3::new(pong.center.x, 5.0, pong.center.z), Vec3::new(0.0, -1.0, 0.0)));
+
+        nav.build_frame(None, ping_ray, 900.0, 700.0, 0.0);
+        assert!(matches!(nav.activate(), Click::Acted));
+        assert_eq!(nav.current, root);
+
+        let start = Instant::now();
+        loop {
+            nav.poll();
+            let frame = nav.build_frame(None, None, 900.0, 700.0, 0.0);
+            let ready = frame.tiles.iter().any(|tile| {
+                tile.name == "ping" && tile.lines.iter().any(|line| line.contains("hello-from-nav"))
+            });
+            if ready {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                let lines: Vec<_> = frame.tiles.iter().map(|tile| (tile.name.clone(), tile.lines.clone())).collect();
+                panic!("ping should print: {lines:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let frame = nav.build_frame(None, None, 900.0, 700.0, 0.0);
+        let body = (frame.tiles[0].rect[0] + 48.0, frame.tiles[0].rect[1] + 56.0);
+        nav.build_frame(Some(body), ping_ray, 900.0, 700.0, 0.0);
+        assert!(matches!(nav.activate(), Click::Quiet));
+        assert_eq!(nav.build_frame(None, None, 900.0, 700.0, 0.0).tiles.len(), 1);
+
+        nav.build_frame(None, pong_ray, 900.0, 700.0, 0.0);
+        assert!(matches!(nav.activate(), Click::Acted));
+        let frame = nav.build_frame(None, None, 900.0, 700.0, 0.0);
+        assert_eq!(frame.tiles.len(), 2);
+        assert_eq!(frame.tiles[0].name, "ping");
+        assert_eq!(frame.tiles[1].name, "pong");
+        assert!(frame.tiles[1].rect[1] > frame.tiles[0].rect[1] + frame.tiles[0].rect[3] - 1.0);
+        assert!((frame.tiles[0].rect[0] - TILE_X).abs() < 0.1);
+
+        nav.navigate(side);
+        assert_ne!(nav.current, root);
+        let frame = nav.build_frame(None, None, 900.0, 700.0, 0.0);
+        assert_eq!(frame.tiles[0].name, "ping · plaza");
+        assert_eq!(frame.tiles[1].name, "pong · plaza");
+        let arrow = frame.tiles[0].arrow;
+        nav.build_frame(Some((arrow[0] + 4.0, arrow[1] + 4.0)), None, 900.0, 700.0, 0.0);
+        assert!(matches!(nav.activate(), Click::Opened { up: false }));
+        assert_eq!(nav.current, root);
+        assert_eq!(nav.build_frame(None, None, 900.0, 700.0, 0.0).tiles[0].name, "ping");
+
+        for _ in 0..4 {
+            let frame = nav.build_frame(None, None, 900.0, 700.0, 0.0);
+            let Some(tile) = frame.tiles.first() else { break };
+            let close = tile.close;
+            nav.build_frame(Some((close[0] + 4.0, close[1] + 4.0)), None, 900.0, 700.0, 0.0);
+            nav.activate();
+        }
+        assert!(nav.build_frame(None, None, 900.0, 700.0, 0.0).tiles.is_empty());
+    }
+
+    #[test]
+    fn an_exited_command_shows_finished_on_its_tile() {
+        let tmp = Tmp::new();
+        let root = tmp.0.join("plaza");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"ping":"echo hello-from-nav","slow":"sleep 30"}}"#,
+        )
+        .unwrap();
+
+        let mut nav = Navigator::open(root, false);
+        let arranged = nav.layout(0.0);
+        let ping = arranged.nodes.iter().find(|node| node.label == "ping").unwrap();
+        let slow = arranged.nodes.iter().find(|node| node.label == "slow").unwrap();
+        let ping_ray = Some((Vec3::new(ping.center.x, 5.0, ping.center.z), Vec3::new(0.0, -1.0, 0.0)));
+        let slow_ray = Some((Vec3::new(slow.center.x, 5.0, slow.center.z), Vec3::new(0.0, -1.0, 0.0)));
+
+        nav.build_frame(None, ping_ray, 900.0, 700.0, 0.0);
+        assert!(matches!(nav.activate(), Click::Acted));
+        nav.build_frame(None, slow_ray, 900.0, 700.0, 0.0);
+        assert!(matches!(nav.activate(), Click::Acted));
+
+        let start = Instant::now();
+        let frame = loop {
+            nav.poll();
+            let frame = nav.build_frame(None, None, 900.0, 700.0, 0.0);
+            if frame.tiles.iter().any(|tile| tile.name == "ping" && tile.finished) {
+                break frame;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                let seen: Vec<_> = frame
+                    .tiles
+                    .iter()
+                    .map(|tile| (tile.name.clone(), tile.finished, tile.lines.clone()))
+                    .collect();
+                panic!("ping should finish: {seen:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let ping = frame.tiles.iter().find(|tile| tile.name == "ping").unwrap();
+        let slow = frame.tiles.iter().find(|tile| tile.name == "slow").unwrap();
+        assert!(ping.tag[2] > 0.0);
+        assert!(ping.tag[1] > ping.rect[1] + 70.0);
+        assert!(ping.tag[1] + ping.tag[3] <= ping.rect[1] + ping.rect[3] + 0.1);
+        assert!(!slow.finished);
+        assert_eq!(slow.tag, [0.0; 4]);
+        assert!(slow.rect[1] >= ping.rect[1] + ping.rect[3]);
+    }
+
+    #[test]
     fn h_hides_dot_directories_and_shows_them_again() {
         let tmp = Tmp::new();
         let root = tmp.0.join("plaza");
@@ -1475,37 +2073,43 @@ mod tests {
         fs::create_dir_all(root.join(".hidden")).unwrap();
         std::os::unix::fs::symlink("plain", root.join(".link")).unwrap();
 
-        let mut nav = Navigator::open(root.clone());
+        let mut nav = Navigator::open(root.clone(), false);
+        assert!(!nav.show_dots);
         let start = Instant::now();
         loop {
             nav.poll();
-            let labels: Vec<_> = nav.layout(0.0).nodes.iter().map(|node| node.label.clone()).collect();
-            if labels.iter().any(|label| label == "plain")
-                && labels.iter().any(|label| label == ".hidden")
-                && labels.iter().any(|label| label == ".link")
-                && labels.iter().any(|label| label == ".secret")
-                && labels.iter().any(|label| label == "kept")
-            {
+            let root_done = nav
+                .dirs
+                .get(&root)
+                .is_some_and(|rec| rec.status == ScanStatus::Done && rec.children.iter().any(|child| child.name == ".hidden"));
+            let plain_done = nav.dirs.get(&root.join("plain")).is_some_and(|rec| {
+                rec.status == ScanStatus::Done && rec.children.iter().any(|child| child.name == ".secret")
+            });
+            if root_done && plain_done {
                 break;
             }
             if start.elapsed() > Duration::from_secs(5) {
-                panic!("dot folders should be visible at first: {labels:?}");
+                panic!("the scan should list dot folders even while they are hidden");
             }
             std::thread::sleep(Duration::from_millis(15));
         }
 
-        nav.toggle_dots();
         let labels: Vec<_> = nav.layout(0.0).nodes.iter().map(|node| node.label.clone()).collect();
         assert!(labels.iter().any(|label| label == "plain"));
         assert!(labels.iter().any(|label| label == "kept"));
         assert!(!labels.iter().any(|label| label == ".hidden" || label == ".secret" || label == ".link"));
-        assert!(nav.build_frame(None, 800.0, 600.0, 0.0).meta.contains("dot folders hidden"));
+        assert!(nav.build_frame(None, None, 800.0, 600.0, 0.0).meta.contains("dot folders hidden"));
 
         nav.toggle_dots();
         let labels: Vec<_> = nav.layout(0.0).nodes.iter().map(|node| node.label.clone()).collect();
         assert!(labels.iter().any(|label| label == ".hidden"));
         assert!(labels.iter().any(|label| label == ".secret"));
         assert!(labels.iter().any(|label| label == ".link"));
-        assert!(!nav.build_frame(None, 800.0, 600.0, 0.0).meta.contains("dot folders hidden"));
+        assert!(!nav.build_frame(None, None, 800.0, 600.0, 0.0).meta.contains("dot folders hidden"));
+
+        nav.toggle_dots();
+        let labels: Vec<_> = nav.layout(0.0).nodes.iter().map(|node| node.label.clone()).collect();
+        assert!(!labels.iter().any(|label| label == ".hidden" || label == ".secret" || label == ".link"));
+        assert!(nav.build_frame(None, None, 800.0, 600.0, 0.0).meta.contains("dot folders hidden"));
     }
 }

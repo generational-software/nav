@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::Value as Json;
 
-/// A command named on a blob. `line` is the thing the name stands for.
+/// A command named on a ring segment. `line` is the thing the name stands for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
     pub name: String,

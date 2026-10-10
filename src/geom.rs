@@ -168,40 +168,11 @@ pub fn disc(segments: usize) -> Mesh {
 pub const RING_INNER: f32 = 0.72;
 pub const RING_OUTER: f32 = 1.0;
 
-/// A round stone. Radius 0.5 and height 1, so the usual instance scale stays a sphere.
-pub fn sphere(stacks: usize, slices: usize) -> Mesh {
-    let stacks = stacks.max(2);
-    let slices = slices.max(3);
-    let mut rings = Vec::with_capacity(stacks - 1);
-    for stack in 1..stacks {
-        let phi = stack as f32 / stacks as f32 * std::f32::consts::PI;
-        let y = 0.5 + 0.5 * phi.cos();
-        let radius = 0.5 * phi.sin();
-        rings.push(ring_points(slices, radius, y));
-    }
-    let mut mesh = Mesh {
-        vertices: Vec::new(),
-        indices: Vec::new(),
-    };
-    let top = [0.0, 1.0, 0.0];
-    let first = &rings[0];
-    for i in 0..slices {
-        let j = (i + 1) % slices;
-        let normal = cross_normal(first[i], top, first[j]);
-        mesh.push_tri(first[i], top, first[j], normal);
-    }
-    for band in rings.windows(2) {
-        push_band(&mut mesh, &band[1], &band[0]);
-    }
-    let bottom = [0.0, 0.0, 0.0];
-    let last = rings.last().expect("a sphere has a ring");
-    for i in 0..slices {
-        let j = (i + 1) % slices;
-        let normal = cross_normal(bottom, last[i], last[j]);
-        mesh.push_tri(bottom, last[i], last[j], normal);
-    }
-    mesh
-}
+/// A command segment is a fatter slice of that ring. The mesh spans 1 radian
+/// around +X. The renderer stretches that angle to the real sweep.
+pub const SEGMENT_INNER: f32 = 0.56;
+pub const SEGMENT_OUTER: f32 = 1.16;
+pub const SEGMENT_REST: f32 = 1.0;
 
 /// Annulus used as the "you are here" ring. Outer radius is 1 and height is 1.
 pub fn ring(segments: usize) -> Mesh {
@@ -238,6 +209,60 @@ pub fn ring(segments: usize) -> Mesh {
         mesh.push_tri(ob0, ib1, ob1, bot_n);
     }
     mesh
+}
+
+/// One radian of a thicker annulus, centered on +X. Height is 1, like the ring.
+pub fn ring_segment(steps: usize) -> Mesh {
+    let steps = steps.max(2);
+    let inner = SEGMENT_INNER;
+    let outer = SEGMENT_OUTER;
+    let sweep = SEGMENT_REST;
+    let mut mesh = Mesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
+    let point = |angle: f32, radius: f32, y: f32| {
+        [radius * angle.cos(), y, radius * angle.sin()]
+    };
+    for i in 0..steps {
+        let a0 = -sweep * 0.5 + sweep * i as f32 / steps as f32;
+        let a1 = -sweep * 0.5 + sweep * (i + 1) as f32 / steps as f32;
+        let ob0 = point(a0, outer, 0.0);
+        let ob1 = point(a1, outer, 0.0);
+        let ot0 = point(a0, outer, 1.0);
+        let ot1 = point(a1, outer, 1.0);
+        let ib0 = point(a0, inner, 0.0);
+        let ib1 = point(a1, inner, 0.0);
+        let it0 = point(a0, inner, 1.0);
+        let it1 = point(a1, inner, 1.0);
+        push_quad(&mut mesh, ob0, ot0, ot1, ob1);
+        push_quad(&mut mesh, ib0, ib1, it1, it0);
+        push_quad(&mut mesh, ot0, it0, it1, ot1);
+        push_quad(&mut mesh, ob0, ob1, ib1, ib0);
+    }
+    let a0 = -sweep * 0.5;
+    let a1 = sweep * 0.5;
+    push_quad(
+        &mut mesh,
+        point(a0, outer, 0.0),
+        point(a0, inner, 0.0),
+        point(a0, inner, 1.0),
+        point(a0, outer, 1.0),
+    );
+    push_quad(
+        &mut mesh,
+        point(a1, outer, 0.0),
+        point(a1, outer, 1.0),
+        point(a1, inner, 1.0),
+        point(a1, inner, 0.0),
+    );
+    mesh
+}
+
+fn push_quad(mesh: &mut Mesh, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) {
+    let normal = cross_normal(a, b, c);
+    mesh.push_tri(a, b, c, normal);
+    mesh.push_tri(a, c, d, normal);
 }
 
 #[cfg(test)]
@@ -286,7 +311,6 @@ mod tests {
             ("pyramid", pyramid()),
             ("crystal", crystal()),
             ("obelisk", obelisk()),
-            ("sphere", sphere(8, 12)),
         ] {
             assert!(!mesh.indices.is_empty(), "{name}");
             let mut side_dots = 0.0_f32;
@@ -317,5 +341,66 @@ mod tests {
             assert!(side_count > 0.0, "{name}");
             assert!(side_dots / side_count > 0.0, "{name} side faces should point outward");
         }
+    }
+
+    #[test]
+    fn a_command_segment_is_a_thicker_slice_of_the_ring() {
+        let mesh = ring_segment(16);
+        assert!(!mesh.indices.is_empty());
+        let mid = (SEGMENT_INNER + SEGMENT_OUTER) * 0.5;
+        let mut upward = 0;
+        let mut caps = 0;
+        for tri in mesh.indices.chunks(3) {
+            let verts = [
+                mesh.vertices[tri[0] as usize],
+                mesh.vertices[tri[1] as usize],
+                mesh.vertices[tri[2] as usize],
+            ];
+            let mut px = 0.0;
+            let mut py = 0.0;
+            let mut pz = 0.0;
+            for vert in verts {
+                let radius = (vert.position[0] * vert.position[0] + vert.position[2] * vert.position[2]).sqrt();
+                assert!(radius > SEGMENT_INNER - 0.02 && radius < SEGMENT_OUTER + 0.02);
+                assert!((0.0..=1.0).contains(&vert.position[1]));
+                let angle = vert.position[2].atan2(vert.position[0]);
+                assert!(angle.abs() <= SEGMENT_REST * 0.5 + 0.001, "angle {angle}");
+                px += vert.position[0];
+                py += vert.position[1];
+                pz += vert.position[2];
+            }
+            px /= 3.0;
+            py /= 3.0;
+            pz /= 3.0;
+            let normal = verts[0].normal;
+            let radial = normal[0] * px + normal[2] * pz;
+            let radius = (px * px + pz * pz).sqrt().max(1e-4);
+            let horizontal = (normal[0] * normal[0] + normal[2] * normal[2]).sqrt().max(1e-4);
+            let aligned = radial.abs() / (radius * horizontal);
+            if normal[1] > 0.5 {
+                upward += 1;
+                assert!(py > 0.5);
+            } else if normal[1] < -0.5 {
+                assert!(py < 0.5);
+            } else if aligned > 0.45 && radius > mid {
+                assert!(radial > 0.0, "outer wall should face out");
+            } else if aligned > 0.45 {
+                assert!(radial < 0.0, "inner wall should face in");
+            } else {
+                let angle = pz.atan2(px);
+                let tangent = [-angle.sin(), 0.0, angle.cos()];
+                let outward = if angle < 0.0 {
+                    [-tangent[0], 0.0, -tangent[2]]
+                } else {
+                    tangent
+                };
+                let dot = normal[0] * outward[0] + normal[2] * outward[2];
+                assert!(dot > 0.5, "end cap normal {normal:?} at {angle}");
+                caps += 1;
+            }
+        }
+        assert!(upward > 0);
+        assert!(caps > 0);
+        assert!(SEGMENT_OUTER - SEGMENT_INNER > RING_OUTER - RING_INNER);
     }
 }
