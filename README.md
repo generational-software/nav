@@ -1,8 +1,20 @@
 # Navigator
 
+This is a toy, an exploration, a bit of fun.
+
 `nav` is a directory navigator for Wayland. It draws the current directory as a plaza of standing stones: one stone for each folder, smaller stones for the folders inside those, and a taller amber stone for the parent. Files are left out.
 
 Scanning runs on background threads. Stones appear as soon as a folder is found, so you can orbit and click while a large directory is still being read.
+
+## Requirements
+
+- Linux.
+- A Wayland session. `WAYLAND_DISPLAY` names the compositor. If that is unset and `DISPLAY` is set, the window opens on X11 instead.
+- A GPU that can draw the window. The picture is wgpu 30, with shaders written in WGSL. On Linux the usual backend is Vulkan.
+- A sans-serif font that fontconfig can see, such as DejaVu Sans or Noto Sans. Folder names come from that list.
+- Rust 1.90 or newer, and Cargo, to build it.
+- bash, if you want the commands on the ring to run. Browsing works without it.
+- A sound device, only if you start nav with `-s`. Without that flag it stays quiet.
 
 ## Run
 
